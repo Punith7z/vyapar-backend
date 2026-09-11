@@ -1,0 +1,199 @@
+--- backend/main.py	2023-10-10 10:00:00.000000000 +0000
++++ backend/main.py	2023-10-10 10:00:00.000000000 +0000
+@@ -1,8 +1,11 @@
+-from fastapi import FastAPI, HTTPException
++from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+ from pydantic import BaseModel
+ import os
+ import json
++import time
+ from google import genai
+ from google.genai import types
++import groq
+ 
+ app = FastAPI()
+ 
+@@ -34,6 +37,18 @@
+ }
+ 
+ api_key = os.getenv("GEMINI_API_KEY")
++groq_api_key = os.getenv("GROQ_API_KEY")
++
++GEMINI_ENABLED = os.getenv("GEMINI_ENABLED", "true").lower() == "true"
++GROQ_ENABLED = os.getenv("GROQ_ENABLED", "true").lower() == "true"
++GEMINI_BILL_PRIMARY = os.getenv("GEMINI_BILL_PRIMARY", "true").lower() == "true"
++GROQ_BILL_FALLBACK = os.getenv("GROQ_BILL_FALLBACK", "true").lower() == "true"
++GROQ_STT_PRIMARY = os.getenv("GROQ_STT_PRIMARY", "true").lower() == "true"
++GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
++GROQ_PARSER_MODEL = os.getenv("GROQ_PARSER_MODEL", "llama-3.3-70b-versatile")
++GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3")
++
++FORCE_GEMINI_FAILURE = os.getenv("FORCE_GEMINI_FAILURE", "false").lower() == "true"
+ 
+ system_instruction = """
+ You are a highly accurate bill parser for an Indian grocery shop app.
+@@ -62,21 +77,63 @@
+ 10. Prices ("10 Rs 100") must be separated into unitPrice/totalPrice. Do not confuse price with quantity.
+ """
+ 
++def parse_with_gemini(text: str, instruction: str) -> dict:
++    if not api_key:
++        raise Exception("AUTH_ERROR: GEMINI_API_KEY is not set.")
++    if FORCE_GEMINI_FAILURE:
++        raise Exception("RATE_LIMITED: Simulated Gemini failure")
++    client = genai.Client()
++    response = client.models.generate_content(
++        model=GEMINI_MODEL,
++        contents=text,
++        config=types.GenerateContentConfig(
++            system_instruction=instruction,
++            temperature=0.0,
++            response_mime_type="application/json"
++        ),
++    )
++    return json.loads(response.text)
++
++def parse_with_groq(text: str, instruction: str) -> dict:
++    if not groq_api_key:
++        raise Exception("AUTH_ERROR: GROQ_API_KEY is not set.")
++    client = groq.Groq(api_key=groq_api_key)
++    completion = client.chat.completions.create(
++        model=GROQ_PARSER_MODEL,
++        messages=[
++            {"role": "system", "content": instruction},
++            {"role": "user", "content": text}
++        ],
++        temperature=0.0,
++        response_format={"type": "json_object"}
++    )
++    return json.loads(completion.choices[0].message.content)
++
+ @app.post("/parse_bill", response_model=ParsedBill)
+ async def parse_bill(request: ParseBillRequest):
+-    if not api_key:
+-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set.")
+-
++    error_msg = ""
++    if GEMINI_ENABLED and GEMINI_BILL_PRIMARY:
++        try:
++            print("Bill parser: PRIMARY=GEMINI")
++            data = parse_with_gemini(f"Parse this bill OCR text:\n\n{request.ocrText}", system_instruction)
++            print("Bill parser: RESULT=SUCCESS")
++            return ParsedBill(**data)
++        except Exception as e:
++            error_msg = str(e)
++            print(f"Gemini failed: {error_msg}")
++            if "AUTH_ERROR" in error_msg or "INVALID_REQUEST" in error_msg:
++                raise HTTPException(status_code=500, detail=error_msg)
++                
++    if GROQ_ENABLED and GROQ_BILL_FALLBACK:
++        try:
++            print("Bill parser: FALLBACK=GROQ")
++            data = parse_with_groq(f"Parse this bill OCR text:\n\n{request.ocrText}", system_instruction)
++            return ParsedBill(**data)
++        except Exception as e:
++            print(f"Groq failed: {e}")
++            raise HTTPException(status_code=500, detail=str(e))
+-    try:
+-        client = genai.Client()
+-        response = client.models.generate_content(
+-            model='gemini-3.8-flash',
+-            contents=f"Parse this bill OCR text:\n\n{request.ocrText}",
+-            config=types.GenerateContentConfig(
+-                system_instruction=system_instruction,
+-                temperature=0.0,
+-                response_mime_type="application/json"
+-            ),
+-        )
+-        data = json.loads(response.text)
+-        return ParsedBill(**data)
+-        
+-    except Exception as e:
+-        print(f"Error parsing bill: {e}")
+-        raise HTTPException(status_code=500, detail=str(e))
++            
++    raise HTTPException(status_code=500, detail=f"All providers failed. Last error: {error_msg}")
+ 
+ class ParseVoiceStockRequest(BaseModel):
+     text: str
+@@ -107,23 +164,48 @@
+ 
+ @app.post("/parse_voice_stock", response_model=ParsedBill)
+ async def parse_voice_stock(request: ParseVoiceStockRequest):
+-    if not api_key:
+-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set.")
+-
++    error_msg = ""
++    prompt_text = f"Language: {request.language}\n\nParse this voice request for adding stock:\n\n\"{request.text}\""
++    
++    if GEMINI_ENABLED:
++        try:
++            print("Voice parser: PRIMARY=GEMINI")
++            data = parse_with_gemini(prompt_text, voice_system_instruction)
++            print("Voice parser: RESULT=SUCCESS")
++            return ParsedBill(**data)
++        except Exception as e:
++            error_msg = str(e)
++            print(f"Gemini voice parser failed: {e}")
++            if "AUTH_ERROR" in error_msg:
++                raise HTTPException(status_code=500, detail=error_msg)
++                
++    if GROQ_ENABLED:
++        try:
++            print("Voice parser: FALLBACK=GROQ")
++            data = parse_with_groq(prompt_text, voice_system_instruction)
++            return ParsedBill(**data)
++        except Exception as e:
++            raise HTTPException(status_code=500, detail=str(e))
++            
++    raise HTTPException(status_code=500, detail="All providers failed")
++
++@app.post("/transcribe_and_parse_voice", response_model=ParsedBill)
++async def transcribe_and_parse_voice(audio: UploadFile = File(...), language: str = Form("en-IN")):
++    if not GROQ_STT_PRIMARY or not groq_api_key:
++        raise HTTPException(status_code=500, detail="GROQ_STT is not configured")
+-    try:
+-        client = genai.Client()
+-        response = client.models.generate_content(
+-            model='gemini-3.8-flash',
+-            contents=f"Language: {request.language}\n\nParse this voice request for adding stock:\n\n\"{request.text}\"",
+-            config=types.GenerateContentConfig(
+-                system_instruction=voice_system_instruction,
+-                temperature=0.0,
+-                response_mime_type="application/json"
+-            ),
+-        )
+-        data = json.loads(response.text)
+-        return ParsedBill(**data)
+-        
+-    except Exception as e:
+-        print(f"Error parsing voice stock: {e}")
+-        raise HTTPException(status_code=500, detail=str(e))
++    try:
++        client = groq.Groq(api_key=groq_api_key)
++        
++        # Save temp file
++        temp_path = f"temp_{time.time()}.m4a"
++        with open(temp_path, "wb") as f:
++            f.write(await audio.read())
++            
++        with open(temp_path, "rb") as f:
++            transcription = client.audio.transcriptions.create(
++                file=(temp_path, f.read()),
++                model=GROQ_STT_MODEL,
++                prompt="Vyapar inventory stock. Product names may include Aashirvaad, Fortune, Amul, Tata, 7UP, rice, atta, oil, milk, biscuits, bottles, packets, kilograms, grams, litres and pieces."
++            )
++            
++        os.remove(temp_path)
++        print(f"Groq Whisper Transcript: {transcription.text}")
++        
++        # Now reuse the exact same text parser
++        req = ParseVoiceStockRequest(text=transcription.text, language=language)
++        return await parse_voice_stock(req)
++        
++    except Exception as e:
++        if os.path.exists(temp_path):
++            os.remove(temp_path)
++        raise HTTPException(status_code=500, detail=str(e))
+ 
+ if __name__ == "__main__":
