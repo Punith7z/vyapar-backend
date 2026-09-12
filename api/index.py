@@ -104,24 +104,35 @@ CRITICAL RULES:
 """
 
 def generate_fast(prompt: str, instruction: str):
-    """Single-model call. No fallback chain = no wasted time on failed models."""
+    """Use the highest accuracy model first. Fallback to latest stable if unavailable."""
     current_key = os.getenv("GEMINI_API_KEY")
     if not current_key:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set.")
 
     client = genai.Client(api_key=current_key)
 
-    # Use ONE reliable model. No fallback chain = instant.
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=instruction,
-            temperature=0.0,
-            response_mime_type="application/json"
-        ),
-    )
-    return json.loads(response.text)
+    # We prioritize 3.8-flash for highest accuracy.
+    # If it fails (e.g. region availability), we instantly fall back to flash-latest.
+    models_to_try = ["gemini-3.8-flash", "gemini-flash-latest"]
+    last_error = None
+
+    for model_name in models_to_try:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=instruction,
+                    temperature=0.0,
+                    response_mime_type="application/json"
+                ),
+            )
+            return json.loads(response.text)
+        except Exception as e:
+            last_error = e
+            print(f"{model_name} failed: {e}")
+            
+    raise last_error
 
 
 @app.get("/health")
